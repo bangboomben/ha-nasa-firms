@@ -21,11 +21,13 @@ and fixes what that approach structurally can't:
 | Count / nearest-distance sensors | template DIY | built in, plus max FRP |
 | Wind at the fire | not available | fetched at each fire's own coordinates, with the smoke-drift angle per fire |
 
-![Deduplicated FIRMS fire detections on the standard Home Assistant map card](assets/map-live-fires.png)
+![Deduplicated FIRMS fire detections, coloured by intensity, on the standard Home Assistant map card](assets/map-live-fires.png)
 
-*Live screenshot (dark theme, standard map card): deduplicated VIIRS detections
-during the July 2026 fires in southern France — each marker is one logical fire,
-merged from up to three satellites.*
+*Live screenshot (dark theme, standard map card with `cluster: false`): seven
+fires inside one monitored area in southern France, 30 July 2026. Each marker is
+one logical fire — merged from up to three satellites — coloured by its fire
+radiative power, yellow for low and orange for moderate. The circle is the
+configured radius around the watched location.*
 
 ## Installation
 
