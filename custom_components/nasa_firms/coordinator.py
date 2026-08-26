@@ -20,11 +20,16 @@ from .api import (
     FirmsAuthError,
     FirmsClient,
     FirmsCluster,
+    CelesTrakClient,
     MetNoClient,
     PersistentSources,
     PlaceDataError,
     PlaceIndex,
     PlaceMatch,
+    ObservationSchedule,
+    OrbitError,
+    OrbitHTTPError,
+    SatelliteObservation,
     WeatherError,
     WindObservation,
     bbox_around,
@@ -90,6 +95,9 @@ class FirmsData:
     # one — the lookup is local and costs nothing per fire after the first —
     # so absence here means the dataset could not be read, nothing else.
     places: dict[str, PlaceMatch] = field(default_factory=dict)
+    # Immediately previous/next configured satellite observation opportunity.
+    # Supplemental only: prediction failures never invalidate FIRMS fire data.
+    observation_schedule: ObservationSchedule = field(default_factory=ObservationSchedule)
 
     @property
     def nearest_wind(self) -> WindObservation | None:
@@ -109,6 +117,17 @@ class FirmsData:
         frps = [c.frp for c in self.clusters if c.frp is not None]
         return max(frps) if frps else None
 
+    @property
+    def next_observation(self) -> SatelliteObservation | None:
+        """Next configured satellite observation opportunity."""
+        return self.observation_schedule.next
+
+    @property
+    def previous_observation(self) -> SatelliteObservation | None:
+        """Most recent configured satellite observation opportunity."""
+        return self.observation_schedule.previous
+
+
 
 class FirmsCoordinator(DataUpdateCoordinator[FirmsData]):
     """Poll FIRMS for all configured satellites and merge the result."""
@@ -122,6 +141,7 @@ class FirmsCoordinator(DataUpdateCoordinator[FirmsData]):
         client: FirmsClient,
         weather: MetNoClient,
         places: PlaceIndex,
+        orbits: CelesTrakClient,
     ) -> None:
         super().__init__(
             hass,
@@ -134,6 +154,10 @@ class FirmsCoordinator(DataUpdateCoordinator[FirmsData]):
         self.weather = weather
         # Shared across entries — see const.DATA_PLACES.
         self.places = places
+        self.orbits = orbits
+        self._orbits_failing = False
+        self._orbit_http_status: int | None = None
+        self._orbit_issue_reported: bool | None = None
         # Latched so a weather outage is reported once, not every 15 minutes.
         self._weather_failing = False
         # Same latch for the place dataset — but this one never clears. The
@@ -296,7 +320,45 @@ class FirmsCoordinator(DataUpdateCoordinator[FirmsData]):
         if data.clusters:
             data.places = await self._async_places(data.clusters)
             data.wind = await self._async_wind(data.clusters)
+        data.observation_schedule = await self._async_observation_schedule()
         return data
+
+    async def _async_observation_schedule(self) -> ObservationSchedule:
+        """Predict previous/next configured coverage without blocking fire data."""
+        try:
+            schedule = await self.orbits.schedule(
+                self.latitude, self.longitude, self.satellites
+            )
+        except OrbitHTTPError as err:
+            self._orbit_http_status = err.status
+            self._async_sync_orbit_issue(err.status)
+            if not self._orbits_failing:
+                self._orbits_failing = True
+                _LOGGER.warning(
+                    "Satellite observation times unavailable, continuing without them: %s",
+                    err,
+                )
+            return ObservationSchedule()
+        except OrbitError as err:
+            self._orbit_http_status = None
+            if not self._orbits_failing:
+                self._orbits_failing = True
+                _LOGGER.warning(
+                    "Satellite observation times unavailable, continuing without them: %s",
+                    err,
+                )
+            return ObservationSchedule()
+        self._orbit_http_status = None
+        self._async_sync_orbit_issue(None)
+        if self._orbits_failing:
+            _LOGGER.info("Satellite observation-time prediction recovered")
+        self._orbits_failing = False
+        return schedule
+
+    @property
+    def orbits_failing(self) -> bool:
+        """Whether VIIRS observation prediction failed this cycle."""
+        return self._orbits_failing
 
     @property
     def weather_failing(self) -> bool:
@@ -320,6 +382,30 @@ class FirmsCoordinator(DataUpdateCoordinator[FirmsData]):
         has nothing left to suppress anyway.
         """
         return self._sources
+
+    @callback
+    def _async_sync_orbit_issue(self, status: int | None) -> None:
+        """Surface CelesTrak HTTP failures once, without retrying them."""
+        active = status is not None
+        if active == self._orbit_issue_reported:
+            return
+        self._orbit_issue_reported = active
+        issue_id = f"orbit_http_{self.config_entry.entry_id}"
+        if not active:
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+            return
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            issue_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="orbit_http",
+            translation_placeholders={
+                "name": self.config_entry.title,
+                "status": str(status),
+            },
+        )
 
     @callback
     def _async_sync_truncation_issue(self, truncated: bool) -> None:

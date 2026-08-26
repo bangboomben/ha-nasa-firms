@@ -22,6 +22,7 @@ from .const import ATTRIBUTION, ATTRIBUTION_WEATHER, DOMAIN
 from .coordinator import FirmsCoordinator, FirmsData, NasaFirmsConfigEntry
 
 
+
 @dataclass(frozen=True, kw_only=True)
 class FirmsSensorDescription(SensorEntityDescription):
     """Sensor description with value/attribute extractors.
@@ -107,6 +108,47 @@ def _max_frp_attributes(coordinator: FirmsCoordinator) -> dict[str, Any]:
     return {"strongest_entity_id": coordinator.entity_ids.get(strongest.id)}
 
 
+def _observation_details(observation, prefix: str = "") -> dict[str, Any]:
+    """Orbital facts for one observation opportunity, optionally prefixed."""
+    def key(name: str) -> str:
+        return f"{prefix}{name}" if prefix else name
+
+    if observation is None:
+        return {
+            key("satellite"): None,
+            key("satellite_name"): None,
+            key("norad_id"): None,
+            key("window_start"): None,
+            key("window_end"): None,
+            key("closest_ground_track_km"): None,
+            key("closest_subpoint_latitude"): None,
+            key("closest_subpoint_longitude"): None,
+            key("swath_km"): None,
+        }
+    return {
+        key("satellite"): observation.satellite,
+        key("satellite_name"): observation.satellite_name,
+        key("norad_id"): observation.norad_id,
+        key("window_start"): observation.start.isoformat(),
+        key("window_end"): observation.end.isoformat(),
+        key("closest_ground_track_km"): observation.closest_ground_track_km,
+        key("closest_subpoint_latitude"): observation.closest_subpoint_latitude,
+        key("closest_subpoint_longitude"): observation.closest_subpoint_longitude,
+        key("swath_km"): observation.swath_km,
+    }
+
+
+def _satellite_observation_attributes(
+    coordinator: FirmsCoordinator,
+) -> dict[str, Any]:
+    """Next-look facts plus the immediately previous look on one entity."""
+    attrs = _observation_details(coordinator.data.next_observation)
+    previous = coordinator.data.previous_observation
+    attrs["previous_observation"] = previous.closest.isoformat() if previous else None
+    attrs.update(_observation_details(previous, "previous_"))
+    return attrs
+
+
 SENSORS: tuple[FirmsSensorDescription, ...] = (
     FirmsSensorDescription(
         key="hotspot_count",
@@ -166,6 +208,14 @@ SENSORS: tuple[FirmsSensorDescription, ...] = (
         value_fn=lambda d: d.max_frp,
         attributes_fn=_max_frp_attributes,
     ),
+    FirmsSensorDescription(
+        key="satellite_observation",
+        translation_key="satellite_observation",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        icon="mdi:satellite-variant",
+        value_fn=lambda d: d.next_observation.closest if d.next_observation else None,
+        attributes_fn=_satellite_observation_attributes,
+    ),
 )
 
 
@@ -176,9 +226,10 @@ async def async_setup_entry(
 ) -> None:
     """Set up the aggregate sensors."""
     coordinator = entry.runtime_data
-    async_add_entities(
+    entities = [
         FirmsSensor(coordinator, entry, description) for description in SENSORS
-    )
+    ]
+    async_add_entities(entities)
 
 
 class FirmsSensor(CoordinatorEntity[FirmsCoordinator], SensorEntity):
@@ -203,6 +254,12 @@ class FirmsSensor(CoordinatorEntity[FirmsCoordinator], SensorEntity):
             model="Active fire data (VIIRS/MODIS)",
             entry_type=DeviceEntryType.SERVICE,
         )
+        if description.key == "satellite_observation":
+            # Keep this explicit fallback name: the lifecycle test proved
+            # Home Assistant registers the timestamp entity reliably with it.
+            # Do not override suggested_object_id here; that caused the entity
+            # to be suppressed on current HA builds during testing.
+            self._attr_name = "Next satellite observation"
 
     @property
     def attribution(self) -> str:

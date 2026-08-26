@@ -9,7 +9,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.loader import async_get_loaded_integration
 
-from .api import FirmsClient, MetNoClient, PlaceIndex
+from .api import CelesTrakClient, FirmsClient, MetNoClient, PlaceIndex
 from .const import (
     CONF_MAP_KEY,
     CONF_REGION,
@@ -59,6 +59,16 @@ def _async_repair_region(hass: HomeAssistant, entry: NasaFirmsConfigEntry) -> No
     )
 
 
+
+
+@callback
+def _async_orbit_client(hass: HomeAssistant, session) -> CelesTrakClient:
+    """One CelesTrak client/cache shared by all FIRMS config entries."""
+    return hass.data.setdefault(DOMAIN, {}).setdefault(
+        "orbit_client", CelesTrakClient(session)
+    )
+
+
 @callback
 def _async_place_index(hass: HomeAssistant) -> PlaceIndex:
     """The place-name index, created once and shared by every entry.
@@ -81,7 +91,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: NasaFirmsConfigEntry) ->
         USER_AGENT.format(version=async_get_loaded_integration(hass, DOMAIN).version),
     )
     coordinator = FirmsCoordinator(
-        hass, entry, client, weather, _async_place_index(hass)
+        hass, entry, client, weather, _async_place_index(hass), _async_orbit_client(hass, session)
     )
     # Before the first refresh, not after: that refresh already filters, and
     # without the learned history it would republish every known factory for
