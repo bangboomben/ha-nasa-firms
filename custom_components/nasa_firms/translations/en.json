@@ -109,6 +109,10 @@
     "truncated": {
       "title": "Fires are missing from {name}",
       "description": "FIRMS cut the response off at its cap of {cap} detections per satellite, so every number for this location is too low — the number of fires, the distance to the nearest one, and the strongest fire radiative power. Nothing about those numbers looks wrong, which is why this is here.\n\nMake the request smaller until the cap is no longer reached: shrink the radius, switch the detection window from 7 days back to 24 hours, or raise the minimum confidence or minimum fire radiative power. This notice disappears by itself once a complete response comes back."
+    },
+    "orbit_http": {
+      "title": "Satellite observation times are unavailable for {name}",
+      "description": "CelesTrak returned HTTP {status} while the integration was fetching satellite orbital data. The integration did not retry the request, in accordance with CelesTrak's usage policy. FIRMS fire data continues to update normally; only the previous/next satellite observation context is unavailable.\n\nThe integration will not automatically retry a non-200 response. Check the Home Assistant network path to celestrak.org and CelesTrak service status; after the cause is resolved, restart Home Assistant to try again."
     }
   },
   "entity": {
@@ -124,6 +128,9 @@
       },
       "max_frp": {
         "name": "Max fire radiative power"
+      },
+      "satellite_observation": {
+        "name": "Next satellite observation"
       }
     }
   }
