@@ -156,7 +156,6 @@ Per config entry:
 | `sensor.<name>_nearest_hotspot` | Distance to the closest fire (`unknown` when there is none). Attributes: `nearest_entity_id`, `bearing`, `direction`, `wind_bearing`, `wind_direction`, `wind_speed`, `smoke_offset` — `wind_speed` is the raw value in **m/s**, for calculating with |
 | `sensor.<name>_wind_at_nearest_hotspot` | The same wind speed as an entity, so it carries its unit and follows your unit system (km/h on a metric instance, mph on a US one). Put this one on a dashboard |
 | `sensor.<name>_max_fire_radiative_power` | Strongest fire in MW, with `strongest_entity_id` pointing at the fire it comes from |
-| `sensor.<name>_next_satellite_observation` | Next configured satellite observation opportunity. Attributes include satellite, observation window, closest ground-track distance, sub-satellite point and swath; the immediately previous observation is included as `previous_*` attributes |
 | `geo_location.*` (source `nasa_firms`) | One entity per fire, with `bearing`, `direction`, `frp_mw`, `intensity`, `confidence`, `satellites`, `detections`, `brightness_k`, `acquired`, `origin`, `place_name`, `place_distance_km` ([see below](#place-names)) — plus `wind_bearing`, `wind_direction`, `wind_speed` and `smoke_offset` on the nearest fires ([see below](#wind-and-smoke-drift)) |
 
 **The distance is not always in kilometres, and the fires always are.** The
@@ -190,28 +189,6 @@ together keep their own ids — candidates are paired nearest-first and no id is
 ever handed out twice. The matching starts over whenever the entry reloads
 (a Home Assistant restart, or saving the options), but a fire that has not
 drifted in the meantime gets the same id back from its coordinates anyway.
-
-## Satellite observation times
-
-The **Next satellite observation** sensor answers a deliberately narrow question:
-**when was the last look, and when is the next one due?** It predicts observation
-opportunities for the satellites enabled on that config entry. The sensor state is
-the closest time of the next opportunity; its attributes carry the satellite,
-window, closest ground-track distance, sub-satellite point and nominal swath. The
-immediately previous opportunity is carried in the `previous_*` attributes on the
-same entity.
-
-Orbital elements come from [CelesTrak](https://celestrak.org/) and are cached for
-at least two hours. Prediction is intentionally short-range (24 hours either side
-of now). CelesTrak is supplementary: if it is unavailable, FIRMS fire updates
-continue normally. A non-200 CelesTrak response is not retried automatically and
-is surfaced in Home Assistant Repairs.
-
-**An observation opportunity is not evidence that a satellite produced a usable
-fire observation, and a pass with no FIRMS detection does not mean there was no
-fire.** Clouds, scan geometry, processing latency and fire intensity can all
-affect what FIRMS reports. The integration therefore exposes orbital facts only;
-it does not interpret a pass without a detection as an all-clear.
 
 ## Place names
 
