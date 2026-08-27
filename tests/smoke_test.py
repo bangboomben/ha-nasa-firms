@@ -30,6 +30,7 @@ class _ClientError(Exception):
 
 _aiohttp.ClientError = _ClientError
 _aiohttp.ClientSession = object
+_aiohttp.ClientTimeout = lambda **kwargs: kwargs
 sys.modules.setdefault("aiohttp", _aiohttp)
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -44,6 +45,7 @@ _spec.loader.exec_module(api)
 FIXTURE = json.loads((Path(__file__).parent / "fixtures" / "metno_compact.json").read_text())
 # The fixture was recorded at 12:59Z on 2026-07-27; its steps run 12:00-16:00Z.
 RECORDED_AT = datetime(2026, 7, 27, 12, 59, tzinfo=timezone.utc)
+ORBIT_FIXTURE = json.loads((Path(__file__).parent / "fixtures" / "orbit_omm.json").read_text())
 
 UTC = timezone.utc
 FAILURES: list[str] = []
@@ -992,6 +994,125 @@ def test_place_index_failures() -> None:
     )
 
 
+
+# --- satellite observation prediction -----------------------------------
+class OrbitResponse:
+    """Async context-manager response for the CelesTrak client."""
+
+    def __init__(self, status: int, payload: object) -> None:
+        self.status = status
+        self._body = json.dumps(payload) if not isinstance(payload, str) else payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    async def text(self) -> str:
+        return self._body
+
+
+class OrbitSession:
+    """Canned synchronous get() returning async context managers."""
+
+    def __init__(self, *responses: OrbitResponse) -> None:
+        self.responses = list(responses)
+        self.calls: list[str] = []
+
+    def get(self, url, timeout=None):
+        self.calls.append(url)
+        if not self.responses:
+            raise AssertionError("orbit client made more requests than expected")
+        return self.responses.pop(0)
+
+
+def test_orbit_parsing_and_drift() -> None:
+    """OMM parsing and short-horizon drift against a recorded SGP4 vector."""
+    print("satellite orbits: parsing and drift")
+    elements = api._parse_omm_json(ORBIT_FIXTURE)
+    check("OMM epoch is UTC", elements.epoch.tzinfo is not None)
+    check("OMM eccentricity parsed", near(elements.ecc, 0.0007417, 1e-9))
+    check("OMM mean motion positive", elements.n > 0.0)
+
+    for label, broken in (
+        ("missing field", {k: v for k, v in ORBIT_FIXTURE.items() if k != "MEAN_MOTION"}),
+        ("bad number", {**ORBIT_FIXTURE, "MEAN_MOTION": "banana"}),
+        ("bad eccentricity", {**ORBIT_FIXTURE, "ECCENTRICITY": 1.2}),
+    ):
+        try:
+            api._parse_omm_json(broken)
+            check(f"malformed OMM: {label}", False, "no exception")
+        except api.OrbitError:
+            check(f"malformed OMM: {label}", True)
+
+    # Reference SGP4 TEME vector for the recorded ISS element set at
+    # 2019-12-09 20:42:00Z. The lightweight propagator is intentionally not
+    # SGP4, but at this ~4 h horizon it should stay comfortably within 15 km.
+    # This assertion catches applying J2 mean-anomaly drift a second time.
+    when = datetime(2019, 12, 9, 20, 42, tzinfo=UTC)
+    got = api._kepler_eci(elements, when)
+    reference = (-6088.92, -936.13, -2866.44)
+    drift_km = sum((a - b) ** 2 for a, b in zip(got, reference)) ** 0.5
+    check("4 h propagation drift stays under 15 km", drift_km < 15.0, f"got {drift_km:.1f} km")
+
+
+def test_configured_spacecraft() -> None:
+    """Configured FIRMS sources expand to the right physical spacecraft."""
+    print("satellite orbits: configured spacecraft")
+    expand = api.CelesTrakClient._configured_spacecraft
+    default = expand(["noaa20", "noaa21", "snpp"])
+    check("default sources map to three spacecraft", [s.key for s in default] == ["noaa20", "noaa21", "snpp"])
+    modis = expand(["modis"])
+    check("MODIS expands to Terra and Aqua", [s.key for s in modis] == ["terra", "aqua"])
+    deduped = expand(["noaa20", "noaa20", "modis"])
+    check("duplicate sources do not duplicate spacecraft", len({s.norad_id for s in deduped}) == len(deduped))
+    check("unknown source is ignored", expand(["unknown"]) == [])
+
+
+async def test_orbit_client_policy() -> None:
+    """Two-hour cache and non-200 stop/cooldown without network access."""
+    print("satellite orbits: CelesTrak policy")
+    sat = api.ORBIT_SATELLITES["noaa20"][0]
+    payload = [ORBIT_FIXTURE]
+
+    session = OrbitSession(OrbitResponse(200, payload), OrbitResponse(200, payload))
+    client = api.CelesTrakClient(session)
+    first = await client._elements(sat)
+    second = await client._elements(sat)
+    check("two-hour cache avoids a second download", len(session.calls) == 1)
+    check("cached elements are reused", first == second)
+    check("FORMAT=JSON is explicit", "FORMAT=JSON" in session.calls[0])
+    check("celestrak.org domain is used", session.calls[0].startswith("https://celestrak.org/"))
+
+    # Age the cache beyond the policy TTL: exactly one new request is allowed.
+    client._element_cache[sat.norad_id] = (
+        datetime.now(UTC) - api.ORBIT_ELEMENT_TTL - timedelta(seconds=1),
+        first,
+    )
+    await client._elements(sat)
+    check("expired cache fetches once", len(session.calls) == 2)
+
+    blocked_session = OrbitSession(OrbitResponse(503, "busy"), OrbitResponse(200, payload))
+    blocked = api.CelesTrakClient(blocked_session)
+    try:
+        await blocked._elements(sat)
+        check("non-200 raises OrbitHTTPError", False, "no exception")
+    except api.OrbitHTTPError as err:
+        check("non-200 raises OrbitHTTPError", err.status == 503)
+    try:
+        await blocked._elements(sat)
+        check("blocked request still reports status", False, "no exception")
+    except api.OrbitHTTPError as err:
+        check("blocked request still reports status", err.status == 503)
+    check("non-200 is not retried during cooldown", len(blocked_session.calls) == 1)
+
+    # Simulate the full 24-hour cooldown elapsing without sleeping.
+    blocked._http_blocked_until = datetime.now(UTC) - timedelta(seconds=1)
+    await blocked._elements(sat)
+    check("a fresh attempt is allowed after 24 h cooldown", len(blocked_session.calls) == 2)
+
+
 def main() -> int:
     """Run everything and report."""
     test_geometry()
@@ -1007,6 +1128,8 @@ def main() -> int:
     test_place_index()
     test_place_index_concurrent_load()
     test_place_index_failures()
+    test_orbit_parsing_and_drift()
+    test_configured_spacecraft()
     asyncio.run(test_firms_client_failures())
     asyncio.run(test_firms_host_fallback())
     asyncio.run(test_client_request())
@@ -1014,6 +1137,7 @@ def main() -> int:
     asyncio.run(test_client_cache_bounds())
     asyncio.run(test_client_backoff_is_global())
     asyncio.run(test_client_failures())
+    asyncio.run(test_orbit_client_policy())
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")
