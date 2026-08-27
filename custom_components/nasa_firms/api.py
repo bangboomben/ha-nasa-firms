@@ -496,8 +496,6 @@ def cluster_hotspots(
     return clusters
 
 
-
-
 # --- Satellite observation-window prediction -------------------------------
 # FIRMS exposes fire detections, not orbit times.  The map overlay is built
 # from orbital elements; for the same plain "last look / next look" context we
@@ -512,6 +510,7 @@ ORBIT_TIMEOUT = 20
 # it more often than that.  The client is shared across config entries, so this
 # cache both respects that policy and avoids duplicate downloads locally.
 ORBIT_ELEMENT_TTL = timedelta(hours=2)
+ORBIT_HTTP_COOLDOWN = timedelta(hours=24)
 # The lightweight Kepler + first-order J2 propagator is intentionally bounded.
 # We only need the immediately previous and next observation opportunity, and
 # every supported polar spacecraft provides global coverage well inside this
@@ -532,8 +531,8 @@ class OrbitError(Exception):
 class OrbitHTTPError(OrbitError):
     """CelesTrak returned a non-success response.
 
-    The CelesTrak usage policy says not to retry HTTP failures automatically;
-    the coordinator surfaces this to Home Assistant Repairs for a human.
+    The failed request is not retried on the normal update cycle. The client
+    allows one fresh attempt only after the 24-hour cooldown.
     """
 
     def __init__(self, status: int) -> None:
@@ -584,11 +583,6 @@ class SatelliteObservation:
     closest_subpoint_longitude: float
     swath_km: float
 
-    @property
-    def swath_margin_km(self) -> float:
-        """Nominal distance remaining to the edge of the instrument swath."""
-        return max(0.0, self.swath_km / 2.0 - self.closest_ground_track_km)
-
 
 @dataclass(frozen=True)
 class ObservationSchedule:
@@ -629,39 +623,21 @@ def _eci_to_subpoint(r_eci: tuple[float, float, float], jd: float) -> tuple[floa
     return math.degrees(lat), ((math.degrees(lon) + 180.0) % 360.0) - 180.0
 
 
-def _tle_epoch(tle1: str) -> datetime:
-    """Parse a TLE epoch into UTC."""
-    field = tle1[18:32].strip()
-    yy = int(field[:2])
-    year = 1900 + yy if yy >= 57 else 2000 + yy
-    day = float(field[2:])
-    return datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=day - 1.0)
+@dataclass(frozen=True)
+class OrbitElements:
+    """Parsed mean orbital elements used by the bounded propagator."""
+
+    epoch: datetime
+    inc: float
+    raan: float
+    ecc: float
+    argp: float
+    mean_anomaly: float
+    n: float
+    a: float
 
 
-def _parse_tle_kepler(tle1: str, tle2: str) -> dict[str, float | datetime]:
-    """Parse the orbital elements needed by the short-horizon predictor."""
-    inc = math.radians(float(tle2[8:16]))
-    raan = math.radians(float(tle2[17:25]))
-    ecc = float(f"0.{tle2[26:33].strip()}")
-    argp = math.radians(float(tle2[34:42]))
-    mean_anomaly = math.radians(float(tle2[43:51]))
-    mean_motion_rev_day = float(tle2[52:63])
-    mu = 398600.4418
-    n = mean_motion_rev_day * 2.0 * math.pi / 86400.0
-    semi_major = (mu / (n * n)) ** (1.0 / 3.0)
-    return {
-        "epoch": _tle_epoch(tle1),
-        "inc": inc,
-        "raan": raan,
-        "ecc": ecc,
-        "argp": argp,
-        "mean_anomaly": mean_anomaly,
-        "n": n,
-        "a": semi_major,
-    }
-
-
-def _parse_omm_json(record: dict[str, Any]) -> dict[str, float | datetime]:
+def _parse_omm_json(record: dict[str, Any]) -> OrbitElements:
     """Parse a CelesTrak OMM JSON record for the short-horizon predictor.
 
     CelesTrak's GP JSON output uses CCSDS OMM field names.  Keeping this
@@ -686,19 +662,26 @@ def _parse_omm_json(record: dict[str, Any]) -> dict[str, float | datetime]:
 
     mu = 398600.4418
     n = mean_motion_rev_day * 2.0 * math.pi / 86400.0
+    if not all(
+        math.isfinite(value)
+        for value in (inc, raan, ecc, argp, mean_anomaly, mean_motion_rev_day)
+    ):
+        raise OrbitError("Invalid CelesTrak orbital element value")
+    if not 0.0 <= ecc < 1.0:
+        raise OrbitError("Invalid CelesTrak eccentricity")
     if n <= 0.0:
         raise OrbitError("Invalid CelesTrak mean motion")
     semi_major = (mu / (n * n)) ** (1.0 / 3.0)
-    return {
-        "epoch": epoch,
-        "inc": inc,
-        "raan": raan,
-        "ecc": ecc,
-        "argp": argp,
-        "mean_anomaly": mean_anomaly,
-        "n": n,
-        "a": semi_major,
-    }
+    return OrbitElements(
+        epoch=epoch,
+        inc=inc,
+        raan=raan,
+        ecc=ecc,
+        argp=argp,
+        mean_anomaly=mean_anomaly,
+        n=n,
+        a=semi_major,
+    )
 
 
 def _solve_kepler(mean_anomaly: float, ecc: float) -> float:
@@ -712,7 +695,7 @@ def _solve_kepler(mean_anomaly: float, ecc: float) -> float:
     return e_anom
 
 
-def _kepler_eci(elements: dict[str, float | datetime], when: datetime) -> tuple[float, float, float]:
+def _kepler_eci(elements: OrbitElements, when: datetime) -> tuple[float, float, float]:
     """Approximate ECI position using two-body Kepler + first-order J2 drift.
 
     This is not SGP4 and is intentionally used only inside the bounded
@@ -720,23 +703,22 @@ def _kepler_eci(elements: dict[str, float | datetime], when: datetime) -> tuple[
     """
     earth_radius = 6378.137
     j2 = 1.08262668e-3
-    epoch = elements["epoch"]
-    assert isinstance(epoch, datetime)
-    dt = (when.astimezone(timezone.utc) - epoch).total_seconds()
-    inc = float(elements["inc"])
-    ecc = float(elements["ecc"])
-    a = float(elements["a"])
-    n = float(elements["n"])
+    dt = (when.astimezone(timezone.utc) - elements.epoch).total_seconds()
+    inc = elements.inc
+    ecc = elements.ecc
+    a = elements.a
+    n = elements.n
     p = a * (1.0 - ecc * ecc)
     factor = j2 * (earth_radius / p) ** 2 * n
     raan_dot = -1.5 * factor * math.cos(inc)
     argp_dot = 0.75 * factor * (5.0 * math.cos(inc) ** 2 - 1.0)
-    mean_dot_j2 = 0.75 * factor * math.sqrt(max(0.0, 1.0 - ecc * ecc)) * (
-        3.0 * math.cos(inc) ** 2 - 1.0
-    )
-    raan = float(elements["raan"]) + raan_dot * dt
-    argp = float(elements["argp"]) + argp_dot * dt
-    mean_anomaly = float(elements["mean_anomaly"]) + (n + mean_dot_j2) * dt
+    raan = elements.raan + raan_dot * dt
+    argp = elements.argp + argp_dot * dt
+    # OMM/TLE mean motion is the Kozai value and already contains the
+    # first-order J2 secular effect on mean anomaly. Adding another J2 mean
+    # drift here double-counts it; only RAAN and argument-of-perigee drift are
+    # applied explicitly.
+    mean_anomaly = elements.mean_anomaly + n * dt
     e_anom = _solve_kepler(mean_anomaly, ecc)
     cos_e = math.cos(e_anom)
     sin_e = math.sin(e_anom)
@@ -775,20 +757,20 @@ def _julian_date(when: datetime) -> float:
     )
 
 
-def _subpoint_at(elements: dict[str, float | datetime], when: datetime) -> tuple[float, float]:
+def _subpoint_at(elements: OrbitElements, when: datetime) -> tuple[float, float]:
     jd = _julian_date(when)
     return _eci_to_subpoint(_kepler_eci(elements, when), jd)
 
 
 def _ground_track_distance_km(
-    elements: dict[str, float | datetime], when: datetime, lat: float, lon: float
+    elements: OrbitElements, when: datetime, lat: float, lon: float
 ) -> float:
     sub_lat, sub_lon = _subpoint_at(elements, when)
     return haversine_km(lat, lon, sub_lat, sub_lon)
 
 
 def _refine_crossing(
-    elements: dict[str, float | datetime], lat: float, lon: float,
+    elements: OrbitElements, lat: float, lon: float,
     swath_half_km: float, a: datetime, b: datetime, want_inside_at_b: bool,
 ) -> datetime:
     """Binary-refine a nominal instrument-swath edge crossing."""
@@ -804,7 +786,7 @@ def _refine_crossing(
 
 def _predict_spacecraft(
     spacecraft: OrbitSatellite,
-    elements: dict[str, float | datetime],
+    elements: OrbitElements,
     lat: float,
     lon: float,
     now: datetime,
@@ -880,20 +862,27 @@ class CelesTrakClient:
 
     def __init__(self, session: aiohttp.ClientSession) -> None:
         self._session = session
-        self._element_cache: dict[int, tuple[datetime, dict[str, Any]]] = {}
-        # A non-200 is a stop condition under CelesTrak policy. Keep the
-        # client blocked until Home Assistant restarts (or the process is
-        # otherwise recreated) rather than retrying every 15 minutes.
+        self._element_cache: dict[int, tuple[datetime, OrbitElements]] = {}
+        # A non-200 is a stop condition under CelesTrak policy. Do not retry
+        # the failed request on the 15-minute update cycle; allow one fresh
+        # attempt only after a full-day cooldown.
         self._http_blocked_status: int | None = None
+        self._http_blocked_until: datetime | None = None
 
     async def _elements(
         self, spacecraft: OrbitSatellite
-    ) -> dict[str, float | datetime]:
+    ) -> OrbitElements:
         """Return cached or freshly fetched CelesTrak OMM JSON elements."""
-        if self._http_blocked_status is not None:
-            raise OrbitHTTPError(self._http_blocked_status)
-        cached = self._element_cache.get(spacecraft.norad_id)
         now = datetime.now(timezone.utc)
+        if (
+            self._http_blocked_status is not None
+            and self._http_blocked_until is not None
+        ):
+            if now < self._http_blocked_until:
+                raise OrbitHTTPError(self._http_blocked_status)
+            self._http_blocked_status = None
+            self._http_blocked_until = None
+        cached = self._element_cache.get(spacecraft.norad_id)
         if cached and now - cached[0] < ORBIT_ELEMENT_TTL:
             return cached[1]
         url = CELESTRAK_GP_URL.format(norad=spacecraft.norad_id)
@@ -905,7 +894,10 @@ class CelesTrakClient:
                     # Deliberately no retry: CelesTrak asks clients to stop on
                     # HTTP errors rather than repeatedly hit the service.
                     self._http_blocked_status = response.status
+                    self._http_blocked_until = now + ORBIT_HTTP_COOLDOWN
                     raise OrbitHTTPError(response.status)
+                self._http_blocked_status = None
+                self._http_blocked_until = None
                 try:
                     payload = json.loads(await response.text())
                 except (json.JSONDecodeError, UnicodeDecodeError) as err:
@@ -917,8 +909,14 @@ class CelesTrakClient:
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             raise OrbitError(f"CelesTrak request failed: {err}") from err
 
-        if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
-            raise OrbitError(f"No usable orbital elements returned for {spacecraft.label}")
+        if (
+            not isinstance(payload, list)
+            or not payload
+            or not isinstance(payload[0], dict)
+        ):
+            raise OrbitError(
+                f"No usable orbital elements returned for {spacecraft.label}"
+            )
         elements = _parse_omm_json(payload[0])
         self._element_cache[spacecraft.norad_id] = (now, elements)
         return elements
@@ -945,7 +943,7 @@ class CelesTrakClient:
             return ObservationSchedule()
         # Fetch sequentially on purpose.  A non-200 is a stop condition under
         # the CelesTrak policy; do not launch additional requests after one.
-        orbital_elements: list[tuple[OrbitSatellite, dict[str, float | datetime]]] = []
+        orbital_elements: list[tuple[OrbitSatellite, OrbitElements]] = []
         for sat in spacecraft:
             elements = await self._elements(sat)
             orbital_elements.append((sat, elements))

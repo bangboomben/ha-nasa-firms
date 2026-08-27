@@ -104,6 +104,9 @@ async def async_get_config_entry_diagnostics(
         # the monitored area as surely as the coordinates this file redacts,
         # and the questions a bug report raises — did the dataset load, did it
         # resolve anything — are answered by the shape alone.
+        "orbits": {
+            "failing": coordinator.orbits_failing,
+        },
         "places": {
             "dataset_loaded": coordinator.places.loaded,
             "dataset_size": len(coordinator.places),
