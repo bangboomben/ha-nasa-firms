@@ -55,6 +55,7 @@ from .const import (
     DOMAIN,
     FETCH_COUNT,
     MAX_WIND_FIRES,
+    ORBIT_ISSUE_ID,
     SOURCES_STORAGE_KEY,
     SOURCES_STORAGE_VERSION,
     UPDATE_INTERVAL,
@@ -385,26 +386,30 @@ class FirmsCoordinator(DataUpdateCoordinator[FirmsData]):
 
     @callback
     def _async_sync_orbit_issue(self, status: int | None) -> None:
-        """Surface CelesTrak HTTP failures once, without retrying them."""
+        """Surface CelesTrak HTTP failures once, without retrying them.
+
+        The notice is deliberately not per-entry: the client, its cache and
+        its cooldown are shared, so this outage is the same outage for every
+        configured location. Every coordinator writes the same issue id, and
+        both operations are idempotent -- the second entry to notice raises a
+        notice that is already there, and the second to recover deletes one
+        that is already gone.
+        """
         active = status is not None
         if active == self._orbit_issue_reported:
             return
         self._orbit_issue_reported = active
-        issue_id = f"orbit_http_{self.config_entry.entry_id}"
         if not active:
-            ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+            ir.async_delete_issue(self.hass, DOMAIN, ORBIT_ISSUE_ID)
             return
         ir.async_create_issue(
             self.hass,
             DOMAIN,
-            issue_id,
+            ORBIT_ISSUE_ID,
             is_fixable=False,
             severity=ir.IssueSeverity.WARNING,
             translation_key="orbit_http",
-            translation_placeholders={
-                "name": self.config_entry.title,
-                "status": str(status),
-            },
+            translation_placeholders={"status": str(status)},
         )
 
     @callback

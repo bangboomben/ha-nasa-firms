@@ -81,6 +81,13 @@ ATTRIBUTION_PLACES = (
 # entries want the same table.
 DATA_PLACES = "places"
 
+# One repair notice for the whole integration, not one per entry. The
+# CelesTrak client and its cooldown are shared across every config entry
+# (see _async_orbit_client), so an orbit outage is never about one location
+# -- v0.9.0 raised the same warning once per entry, which said the same thing
+# twice to anyone watching two areas and five times to anyone watching five.
+ORBIT_ISSUE_ID = "orbit_http"
+
 # met.no hard-blocks generic agents: their ToS wants the application and a
 # contact address. The version comes from the manifest so there is only ever
 # one place to bump.
