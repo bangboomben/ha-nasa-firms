@@ -224,8 +224,11 @@ least two hours and shared by every entry; the prediction stays inside a
 24-hour window either side of now. The source is supplementary — if CelesTrak
 is unreachable, fire data updates exactly as before. A non-200 answer is never
 retried on the update cycle, because their usage policy asks clients to stop
-rather than hammer; the integration waits a full day before trying again and
-says so in Repairs meanwhile.
+rather than hammer. How long it waits before a fresh attempt depends on what
+the answer meant: about an hour when their service was merely busy, a full day
+when the request was refused outright, and whatever a `Retry-After` header asks
+for in between. It says so in Repairs meanwhile — one notice for the whole
+integration, since the elements are shared by every entry.
 
 ## Place names
 

@@ -235,6 +235,16 @@ attributes, the pointer is the pattern.
   and exercises bbox/haversine/clustering plus the met.no client against a
   recorded payload in `tests/fixtures/`. It lives in the repo since v0.3.0;
   earlier versions kept it out of tree, which is why older notes say to ask.
+- **Repair notices do not survive a restart (verified 2026-08-29, live
+  instance).** Everything this integration raises is non-persistent, and HA
+  keeps only a stub for those in `.storage/repairs.issue_registry` — loaded
+  back as inactive, never shown again. The file is a graveyard by design: 162
+  entries on the live box, most of them long-dead HACS `restart_required`
+  notices. So **do not write migration code that deletes an old issue id**;
+  v0.9.1 had one and it was measurably dead, because changing the integration
+  requires a restart and the restart already cleared the notice. Checking the
+  registry file proves nothing either way — ask HA itself over the WebSocket
+  (`repairs/list_issues`), which is what showed the two notices were gone.
 - Runtime verification happens on the maintainer's live HA instance before
   any release; this repo has no HA test harness yet (planned with the Core
   prep: pytest-homeassistant-custom-component).
