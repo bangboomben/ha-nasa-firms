@@ -510,7 +510,20 @@ ORBIT_TIMEOUT = 20
 # it more often than that.  The client is shared across config entries, so this
 # cache both respects that policy and avoids duplicate downloads locally.
 ORBIT_ELEMENT_TTL = timedelta(hours=2)
+# Two cooldowns, because "do not repeat a failed request" covers two very
+# different answers.  A 403 or a 404 is about us -- blocked client, wrong
+# CATNR -- and asking again soon changes nothing, so it costs a full day.  A
+# 503 or a 429 says their service is busy right now, which passes in minutes;
+# spending a day of silence on that leaves the observation times missing long
+# after the outage ended.  Not hypothetical: the live instance saw two such
+# blips on 2026-08-28 and 2026-08-29, and CelesTrak was answering 200 again
+# within the half hour both times.
 ORBIT_HTTP_COOLDOWN = timedelta(hours=24)
+ORBIT_BUSY_COOLDOWN = timedelta(hours=1)
+# Server-side conditions, not verdicts on this client.  Everything outside
+# this set keeps the full-day cooldown, which is the safe default: an
+# unrecognised refusal is treated as one aimed at us.
+ORBIT_BUSY_STATUSES = frozenset({429, 500, 502, 503, 504})
 # The lightweight Kepler + first-order J2 propagator is intentionally bounded.
 # We only need the immediately previous and next observation opportunity, and
 # every supported polar spacecraft provides global coverage well inside this
@@ -857,6 +870,49 @@ def _predict_spacecraft(
     return previous, next_obs
 
 
+def _parse_retry_after(value: str | None) -> timedelta | None:
+    """RFC 9110 Retry-After, in either of its two spellings.
+
+    Returns None for a missing or unparseable header, so the caller falls
+    back to its own cooldown rather than to no cooldown at all.
+    """
+    if not value:
+        return None
+    raw = value.strip()
+    try:
+        return timedelta(seconds=int(raw))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        # An HTTP date without an offset is GMT by definition.
+        when = when.replace(tzinfo=timezone.utc)
+    return when - datetime.now(timezone.utc)
+
+
+def _orbit_cooldown(status: int, retry_after: str | None) -> timedelta:
+    """How long to leave CelesTrak alone after a non-200.
+
+    Never sooner than the busy cooldown and never later than a day, with the
+    server's own Retry-After choosing inside that range when it sends one.
+    Clamping both ends on purpose: a header asking for five seconds must not
+    turn this into a retry loop, and one asking for a week must not park the
+    observation times indefinitely -- at which point a fresh attempt costs one
+    request and answers the question.
+    """
+    if status not in ORBIT_BUSY_STATUSES:
+        return ORBIT_HTTP_COOLDOWN
+    wanted = _parse_retry_after(retry_after)
+    if wanted is None:
+        return ORBIT_BUSY_COOLDOWN
+    return max(ORBIT_BUSY_COOLDOWN, min(wanted, ORBIT_HTTP_COOLDOWN))
+
+
 class CelesTrakClient:
     """Fetch current CelesTrak elements and predict observation opportunities."""
 
@@ -891,10 +947,14 @@ class CelesTrakClient:
                 url, timeout=aiohttp.ClientTimeout(total=ORBIT_TIMEOUT)
             ) as response:
                 if response.status != 200:
-                    # Deliberately no retry: CelesTrak asks clients to stop on
-                    # HTTP errors rather than repeatedly hit the service.
+                    # Deliberately no retry on this cycle: CelesTrak asks
+                    # clients to stop on an error rather than repeatedly hit
+                    # the service. How long we stop for depends on what the
+                    # status actually says -- see ORBIT_BUSY_STATUSES.
                     self._http_blocked_status = response.status
-                    self._http_blocked_until = now + ORBIT_HTTP_COOLDOWN
+                    self._http_blocked_until = now + _orbit_cooldown(
+                        response.status, response.headers.get("Retry-After")
+                    )
                     raise OrbitHTTPError(response.status)
                 self._http_blocked_status = None
                 self._http_blocked_until = None
@@ -906,7 +966,16 @@ class CelesTrakClient:
                     ) from err
         except OrbitHTTPError:
             raise
-        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+        except asyncio.TimeoutError as err:
+            # str() of a TimeoutError is empty, so folding it into the generic
+            # message logged "CelesTrak request failed: " with nothing after
+            # the colon -- which is exactly how every real timeout read on the
+            # live instance. Same trap FIRMS and met.no already carry a note
+            # about; any future client here needs the same separate clause.
+            raise OrbitError(
+                f"CelesTrak request timed out after {ORBIT_TIMEOUT} s"
+            ) from err
+        except aiohttp.ClientError as err:
             raise OrbitError(f"CelesTrak request failed: {err}") from err
 
         if (

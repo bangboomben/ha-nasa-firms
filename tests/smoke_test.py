@@ -999,9 +999,12 @@ def test_place_index_failures() -> None:
 class OrbitResponse:
     """Async context-manager response for the CelesTrak client."""
 
-    def __init__(self, status: int, payload: object) -> None:
+    def __init__(
+        self, status: int, payload: object, headers: dict | None = None
+    ) -> None:
         self.status = status
         self._body = json.dumps(payload) if not isinstance(payload, str) else payload
+        self.headers = headers or {}
 
     async def __aenter__(self):
         return self
@@ -1024,7 +1027,21 @@ class OrbitSession:
         self.calls.append(url)
         if not self.responses:
             raise AssertionError("orbit client made more requests than expected")
-        return self.responses.pop(0)
+        nxt = self.responses.pop(0)
+        if isinstance(nxt, BaseException):
+            raise nxt
+        return nxt
+
+
+class TimingOutOrbitSession:
+    """A session whose every request times out, as aiohttp would raise it."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def get(self, url, timeout=None):
+        self.calls.append(url)
+        raise asyncio.TimeoutError()
 
 
 def test_orbit_parsing_and_drift() -> None:
@@ -1070,6 +1087,96 @@ def test_configured_spacecraft() -> None:
     check("unknown source is ignored", expand(["unknown"]) == [])
 
 
+def test_orbit_cooldown_rules() -> None:
+    """Retry-After parsing and the two-tier cooldown, as pure functions."""
+    print("satellite orbits: cooldown rules")
+    parse = api._parse_retry_after
+    check("missing Retry-After is None", parse(None) is None)
+    check("empty Retry-After is None", parse("") is None)
+    check("delay-seconds is parsed", parse("120") == timedelta(seconds=120))
+    check("surrounding space is tolerated", parse("  90 ") == timedelta(seconds=90))
+    check("nonsense is None, not zero", parse("soon") is None)
+
+    # HTTP-date form. Built relative to now so the test does not rot.
+    future = datetime.now(UTC) + timedelta(minutes=30)
+    stamp = future.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    parsed = parse(stamp)
+    check(
+        "HTTP-date form lands within a minute",
+        parsed is not None and abs(parsed - timedelta(minutes=30)) < timedelta(minutes=1),
+        f"got {parsed}",
+    )
+    past = (datetime.now(UTC) - timedelta(hours=2)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    check("a past HTTP-date gives a negative delta", parse(past) < timedelta(0))
+
+    cooldown = api._orbit_cooldown
+    # A refusal aimed at this client costs the full day, header or not.
+    check("403 gets the long cooldown", cooldown(403, None) == api.ORBIT_HTTP_COOLDOWN)
+    check("404 gets the long cooldown", cooldown(404, None) == api.ORBIT_HTTP_COOLDOWN)
+    check(
+        "403 ignores Retry-After",
+        cooldown(403, "60") == api.ORBIT_HTTP_COOLDOWN,
+    )
+    check(
+        "an unknown status is treated as aimed at us",
+        cooldown(418, None) == api.ORBIT_HTTP_COOLDOWN,
+    )
+    # A busy server is a passing condition.
+    for status in (429, 500, 502, 503, 504):
+        check(
+            f"{status} gets the short cooldown",
+            cooldown(status, None) == api.ORBIT_BUSY_COOLDOWN,
+        )
+    check(
+        "the short cooldown is genuinely shorter",
+        api.ORBIT_BUSY_COOLDOWN < api.ORBIT_HTTP_COOLDOWN,
+    )
+    # Retry-After decides, but only inside the two bounds.
+    check(
+        "a longer Retry-After is honoured",
+        cooldown(503, str(int(timedelta(hours=3).total_seconds()))) == timedelta(hours=3),
+    )
+    check(
+        "a five-second Retry-After cannot start a retry loop",
+        cooldown(503, "5") == api.ORBIT_BUSY_COOLDOWN,
+    )
+    check(
+        "a week-long Retry-After is capped at a day",
+        cooldown(429, str(int(timedelta(days=7).total_seconds())))
+        == api.ORBIT_HTTP_COOLDOWN,
+    )
+    check(
+        "an unparseable header falls back to the short cooldown",
+        cooldown(503, "whenever") == api.ORBIT_BUSY_COOLDOWN,
+    )
+
+
+async def test_orbit_timeout_message() -> None:
+    """A timed-out orbit request must say so, not trail off after a colon."""
+    print("satellite orbits: timeout message")
+    sat = api.ORBIT_SATELLITES["noaa20"][0]
+    client = api.CelesTrakClient(TimingOutOrbitSession())
+    try:
+        await client._elements(sat)
+        check("a timeout raises OrbitError", False, "no exception")
+    except api.OrbitHTTPError:
+        check("a timeout is not mistaken for an HTTP refusal", False, "got OrbitHTTPError")
+    except api.OrbitError as err:
+        message = str(err)
+        check("a timeout raises OrbitError", True)
+        # The v0.9.0 bug: str(TimeoutError) is empty, so the message logged as
+        # "CelesTrak request failed: " with nothing after the colon.
+        check("the message is not left dangling", not message.rstrip().endswith(":"), repr(message))
+        check("the message names the timeout", "timed out" in message, repr(message))
+        check(
+            "the message names the limit",
+            str(api.ORBIT_TIMEOUT) in message,
+            repr(message),
+        )
+    # A timeout is not an HTTP refusal, so it must not arm the cooldown at all.
+    check("a timeout does not block the client", client._http_blocked_until is None)
+
+
 async def test_orbit_client_policy() -> None:
     """Two-hour cache and non-200 stop/cooldown without network access."""
     print("satellite orbits: CelesTrak policy")
@@ -1106,11 +1213,51 @@ async def test_orbit_client_policy() -> None:
     except api.OrbitHTTPError as err:
         check("blocked request still reports status", err.status == 503)
     check("non-200 is not retried during cooldown", len(blocked_session.calls) == 1)
+    # A busy server is a passing condition: an hour, not a day. This is what
+    # kept the observation times missing all day on the live instance after
+    # CelesTrak was answering 200 again within the half hour.
+    held = blocked._http_blocked_until - datetime.now(UTC)
+    check(
+        "503 holds for about an hour, not a day",
+        timedelta(minutes=55) < held <= api.ORBIT_BUSY_COOLDOWN,
+        f"got {held}",
+    )
 
-    # Simulate the full 24-hour cooldown elapsing without sleeping.
+    # Simulate that cooldown elapsing without sleeping.
     blocked._http_blocked_until = datetime.now(UTC) - timedelta(seconds=1)
     await blocked._elements(sat)
-    check("a fresh attempt is allowed after 24 h cooldown", len(blocked_session.calls) == 2)
+    check("a fresh attempt is allowed once the cooldown lapses", len(blocked_session.calls) == 2)
+
+    # A refusal aimed at this client still costs a full day.
+    refused_session = OrbitSession(OrbitResponse(403, "denied"))
+    refused = api.CelesTrakClient(refused_session)
+    try:
+        await refused._elements(sat)
+        check("403 raises OrbitHTTPError", False, "no exception")
+    except api.OrbitHTTPError as err:
+        check("403 raises OrbitHTTPError", err.status == 403)
+    held_403 = refused._http_blocked_until - datetime.now(UTC)
+    check(
+        "403 still holds for a full day",
+        timedelta(hours=23, minutes=55) < held_403 <= api.ORBIT_HTTP_COOLDOWN,
+        f"got {held_403}",
+    )
+
+    # And the server's own Retry-After is read off the response.
+    asked_session = OrbitSession(
+        OrbitResponse(503, "busy", {"Retry-After": str(3 * 3600)})
+    )
+    asked = api.CelesTrakClient(asked_session)
+    try:
+        await asked._elements(sat)
+    except api.OrbitHTTPError:
+        pass
+    held_asked = asked._http_blocked_until - datetime.now(UTC)
+    check(
+        "Retry-After from the response is honoured",
+        timedelta(hours=2, minutes=55) < held_asked <= timedelta(hours=3),
+        f"got {held_asked}",
+    )
 
 
 def main() -> int:
@@ -1129,6 +1276,7 @@ def main() -> int:
     test_place_index_concurrent_load()
     test_place_index_failures()
     test_orbit_parsing_and_drift()
+    test_orbit_cooldown_rules()
     test_configured_spacecraft()
     asyncio.run(test_firms_client_failures())
     asyncio.run(test_firms_host_fallback())
@@ -1138,6 +1286,7 @@ def main() -> int:
     asyncio.run(test_client_backoff_is_global())
     asyncio.run(test_client_failures())
     asyncio.run(test_orbit_client_policy())
+    asyncio.run(test_orbit_timeout_message())
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")
