@@ -79,7 +79,8 @@ the `cluster` option the recommended card below depends on.
 
    [![Open your Home Assistant instance and show the blueprint import dialog with a specific blueprint pre-filled.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fbangboomben%2Fha-nasa-firms%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Fnasa_firms%2Ffire_within_distance.yaml)
 
-Satellites, detection window (24 h / 7 days), minimum confidence, minimum fire
+Satellites, detection window (24 h / 7 days — [what FIRMS means by
+that](#honest-limitations)), minimum confidence, minimum fire
 radiative power, [ignore zones](#ignore-zones) and
 [learned heat sources](#learned-heat-sources) can all be changed later via the
 entry's *Configure* dialog.
@@ -321,6 +322,17 @@ step with the version you installed:
   category at all. Someone in the community thread had been relying on it for
   exactly this. Regional feeds such as `nsw_rural_fire_service_feed` and
   `qld_bushfire_feed` do cover fire, but only their own corner of the world.
+- **The "24 h" window is yesterday and today in UTC, not the last 24 hours.**
+  FIRMS fills its `24hrs` layer by calendar day, so right after midnight UTC
+  it holds roughly a day of detections and just before the next midnight
+  close to two. A fire can therefore stay on the map for up to ~48 hours
+  after the satellite saw it, long after it was put out — verified against
+  the live service on 2026-10-25, when a detection from 01:07 UTC the
+  previous day was still being served at 17:07 UTC. NASA's documentation
+  does not define the window either way. Every fire carries its
+  acquisition time in the `acquired` attribute; read that, not the clock.
+  The "7 days" window is cut the same way: today plus the seven calendar
+  days before it, so up to eight days of detections.
 - FIRMS detects **thermal anomalies**, not wildfires. Factories, flares and
   landfills show up too. The confidence and FRP filters thin them out,
   [ignore zones](#ignore-zones) remove the ones you know about by name, and
